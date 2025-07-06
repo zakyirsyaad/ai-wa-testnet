@@ -39,6 +39,19 @@ const openAiCompletion = async (messageHistory) => {
   }
 };
 
+// Helper function to parse activity details from a string
+const parseDetails = (detailsString) => {
+  const details = {};
+  detailsString.split(",").forEach((part) => {
+    const [key, ...valueParts] = part.trim().split(" ");
+    const value = valueParts.join(" ");
+    if (key && value) {
+      details[key.trim()] = value.trim();
+    }
+  });
+  return details;
+};
+
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: "testnet-ai-wa" }),
   puppeteer: {
@@ -54,97 +67,176 @@ client.on("qr", (qr) => {
   qrcode.generate(qr, { small: true });
 });
 
+// Main message handler
 client.on("message_create", async (message) => {
   const messageBody = (message.body || "").trim();
   const chatId = message.from;
-  const hasMedia = message.hasMedia;
-
-  if (!messageBody.toLowerCase().startsWith("jek")) {
-    return;
-  }
-
-  console.log(`Processing message from ${chatId}:`, messageBody);
 
   try {
-    // 1. Find or create the user
-    let { data: user, error: userError } = await supabase.from("users").select("id, chat_history").eq("id", chatId).single();
+    // Fetch user and their state first
+    let { data: user, error: userError } = await supabase.from("users").select("id, chat_history, conversation_state").eq("id", chatId).single();
 
-    if (userError && userError.code !== "PGRST116") {
-      throw new Error(`Error fetching user: ${userError.message}`);
-    }
-
-    if (!user) {
+    // Create user if they don't exist
+    if (userError && userError.code === "PGRST116") {
       const { data: newUser, error: newUserError } = await supabase
         .from("users")
         .insert([{ id: chatId, chat_history: [] }])
-        .select("id, chat_history")
+        .select("id, chat_history, conversation_state")
         .single();
-      if (newUserError) {
-        throw new Error(`Error creating user: ${newUserError.message}`);
-      }
+      if (newUserError) throw new Error(`Error creating user: ${newUserError.message}`);
       user = newUser;
       console.log(`New user created: ${user.id}`);
+    } else if (userError) {
+      throw new Error(`Error fetching user: ${userError.message}`);
     }
 
-    // 2. Prepare the content for the AI
-    const dbHistory = user.chat_history || [];
-    const formattedHistory = dbHistory.map((msg) => ({
-      role: msg.role,
-      content: [{ type: "text", text: msg.content }],
-    }));
-
-    const newUserMessageParts = [];
-    let userMessageForDb = { role: "user", content: messageBody };
-
-    // **THE FIX**: Ensure image part comes first if it exists
-    if (hasMedia) {
-      console.log("Message has media, downloading...");
-      const media = await message.downloadMedia();
-      if (media && media.mimetype.startsWith("image/")) {
-        const imageBuffer = Buffer.from(media.data, "base64");
-        activeImages[chatId] = imageBuffer; // Store in active memory
-        newUserMessageParts.push({ type: "image", image: imageBuffer });
-        userMessageForDb.content = `${messageBody} [Image Sent]`;
-      }
-    } else if (activeImages[chatId]) {
-      console.log(`Attaching active image for user ${chatId}`);
-      newUserMessageParts.push({ type: "image", image: activeImages[chatId] });
+    // --- ROUTER: Check conversation state ---
+    if (user.conversation_state?.type === "awaiting_daily_archive_confirmation") {
+      return await handleDailyArchiveConfirmation(message, user);
     }
 
-    // Always add the text part after the potential image part
-    newUserMessageParts.push({ type: "text", text: messageBody });
+    // --- Daily Proactive Check (runs only if state is normal) ---
+    const today = new Date().setHours(0, 0, 0, 0);
+    const lastPrompted = new Date(user.conversation_state?.prompted_at || 0).setHours(0, 0, 0, 0);
 
-    const aiMessages = [...formattedHistory, { role: "user", content: newUserMessageParts }];
+    if (today > lastPrompted) {
+      const { count, error: logError } = await supabase.from("activity_logs").select("id", { count: "exact", head: true }).eq("user_id", chatId).eq("is_archived", false);
 
-    // 3. Get the response from AI
-    const response = await openAiCompletion(aiMessages);
+      if (logError) throw new Error(`Error checking for unarchived logs: ${logError.message}`);
 
-    if (response) {
-      // Clear active image if user starts a new topic without an image
-      if (!hasMedia && messageBody.toLowerCase().includes("lupakan gambar")) {
-        delete activeImages[chatId];
-        console.log(`Active image for ${chatId} has been forgotten.`);
+      if (count && count > 0) {
+        // Check count directly
+        return await promptForDailyArchive(message, user);
       }
+    }
 
-      // 4. Prepare the new history for the database
-      const newDbHistory = [...dbHistory, userMessageForDb, { role: "assistant", content: response }];
-
-      // 5. Update the user's chat_history in the database
-      const { error: updateError } = await supabase.from("users").update({ chat_history: newDbHistory }).eq("id", user.id);
-
-      if (updateError) {
-        throw new Error(`Error updating chat history: ${updateError.message}`);
-      }
-
-      // 6. Send the response to the user
-      await client.sendMessage(chatId, response);
+    // --- Normal message processing ---
+    if (messageBody.toLowerCase().startsWith("jek, catat")) {
+      await handleLogActivity(message, user);
+    } else if (messageBody.toLowerCase().startsWith("jek")) {
+      await handleAiChat(message, user);
     }
   } catch (error) {
     console.error("An error occurred:", error.message);
-    await client.sendMessage(chatId, "Sorry, an error occurred. Please try again later.");
+    await client.sendMessage(chatId, "Maaf, terjadi kesalahan. Silakan coba lagi.");
   }
 });
 
+// --- State-specific handlers ---
+
+async function promptForDailyArchive(message, user) {
+  const chatId = user.id;
+  console.log(`User ${chatId} has unarchived logs. Prompting for daily archive.`);
+
+  const newState = { type: "awaiting_daily_archive_confirmation", prompted_at: new Date().toISOString() };
+  await supabase.from("users").update({ conversation_state: newState }).eq("id", chatId);
+
+  await client.sendMessage(chatId, "Selamat pagi. Saya melihat ada beberapa aktivitas dari hari sebelumnya yang belum diarsipkan. Apakah Anda ingin mengarsipkan rekam medis Anda sekarang?");
+  // We don't process the original message, we wait for the next one.
+}
+
+async function handleDailyArchiveConfirmation(message, user) {
+  const messageBody = message.body.trim().toLowerCase();
+  const chatId = user.id;
+
+  if (["ya", "yes", "ok", "y"].includes(messageBody)) {
+    await client.sendMessage(chatId, "Baik, memulai proses arsip... ⏳");
+
+    const { data: logs, error: fetchError } = await supabase.from("activity_logs").select("id, activity_type, details, activity_at").eq("user_id", chatId).eq("is_archived", false);
+
+    if (fetchError) throw new Error(`Error fetching logs: ${fetchError.message}`);
+    if (!logs || logs.length === 0) {
+      await client.sendMessage(chatId, "Tidak ada data baru untuk diarsipkan.");
+    } else {
+      console.log(`[SIMULASI] Data JSON siap untuk diunggah ke Pinata:`);
+      console.log(JSON.stringify(logs, null, 2));
+      console.log(`[SIMULASI] Upload ke Pinata berhasil. CID: QmSimulasi...`);
+      console.log(`[SIMULASI] Menulis CID ke Smart Contract...`);
+
+      const logIds = logs.map((l) => l.id);
+      await supabase.from("activity_logs").update({ is_archived: true }).in("id", logIds);
+
+      await client.sendMessage(chatId, `✅ Berhasil. Rekam medis Anda telah diarsipkan secara permanen.`);
+    }
+  } else {
+    await client.sendMessage(chatId, "Baik, data tidak diarsipkan saat ini. Saya akan mengingatkan Anda lagi besok.");
+  }
+
+  // Reset conversation state, but keep the prompted_at time to prevent re-prompting today
+  const newState = { prompted_at: user.conversation_state.prompted_at };
+  await supabase.from("users").update({ conversation_state: newState }).eq("id", chatId);
+}
+
+async function handleLogActivity(message, user) {
+  const messageBody = message.body.trim();
+  const chatId = user.id;
+
+  const command = messageBody.substring("jek, catat".length).trim();
+  const [activity_type, detailsString] = command.split(":");
+
+  if (!activity_type || !detailsString) {
+    return await client.sendMessage(chatId, "Format salah. Gunakan: jek, catat [aktivitas]: [detail1] [nilai1], [detail2] [nilai2]");
+  }
+
+  const details = parseDetails(detailsString);
+
+  await supabase.from("activity_logs").insert([
+    {
+      user_id: chatId,
+      activity_type: activity_type.trim(),
+      details: details,
+    },
+  ]);
+
+  await client.sendMessage(chatId, `✅ Aktivitas '${activity_type.trim()}' berhasil dicatat.`);
+}
+
+async function handleAiChat(message, user) {
+  const messageBody = message.body.trim();
+  const chatId = user.id;
+  const hasMedia = message.hasMedia;
+
+  const dbHistory = user.chat_history || [];
+  const formattedHistory = dbHistory.map((msg) => ({
+    role: msg.role,
+    content: [{ type: "text", text: msg.content }],
+  }));
+
+  const newUserMessageParts = [];
+  let userMessageForDb = { role: "user", content: messageBody };
+
+  if (hasMedia) {
+    const media = await message.downloadMedia();
+    if (media && media.mimetype.startsWith("image/")) {
+      const imageBuffer = Buffer.from(media.data, "base64");
+      activeImages[chatId] = imageBuffer;
+      newUserMessageParts.push({ type: "image", image: imageBuffer });
+      userMessageForDb.content = `${messageBody} [Image Sent]`;
+    }
+  } else if (activeImages[chatId]) {
+    newUserMessageParts.push({ type: "image", image: activeImages[chatId] });
+  }
+
+  newUserMessageParts.push({ type: "text", text: messageBody });
+
+  const aiMessages = [...formattedHistory, { role: "user", content: newUserMessageParts }];
+  const response = await openAiCompletion(aiMessages);
+
+  if (response) {
+    if (!hasMedia && messageBody.toLowerCase().includes("lupakan gambar")) {
+      delete activeImages[chatId];
+      console.log(`Active image for ${chatId} has been forgotten.`);
+    }
+
+    const newDbHistory = [...dbHistory, userMessageForDb, { role: "assistant", content: response }];
+
+    await supabase.from("users").update({ chat_history: newDbHistory, conversation_state: user.conversation_state }).eq("id", user.id);
+
+    await client.sendMessage(chatId, response);
+  }
+}
+
+// Start the client
 client.initialize();
 
 app.listen(PORT, () => {
