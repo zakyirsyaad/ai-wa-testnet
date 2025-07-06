@@ -1,13 +1,12 @@
-2025/07/06-14:19:23.947 34a4 Reusing MANIFEST D:\ExploreCode\ai-wa\.wwebjs_auth\session-testnet-ai-wa\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
-2025/07/06-14:19:23.947 34a4 Recovering log #94
-2025/07/06-14:19:24.000 34a4 Reusing old log D:\ExploreCode\ai-wa\.wwebjs_auth\session-testnet-ai-wa\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/000094.log 
-2025/07/06-14:19:25.525 52d8 Level-0 table #99: started
-2025/07/06-14:19:25.609 52d8 Level-0 table #99: 438827 bytes OK
-2025/07/06-14:19:25.737 52d8 Delete type=0 #94
-2025/07/06-14:19:25.737 52d8 Manual compaction at level-0 from '\x00)\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00*\x00\x00\x00' @ 0 : 0; will stop at (end)
-2025/07/06-14:19:26.748 135c Compacting 1@1 + 1@2 files
-2025/07/06-14:19:27.223 135c Generated table #100@1: 50060 keys, 1915862 bytes
-2025/07/06-14:19:27.223 135c Compacted 1@1 + 1@2 files => 1915862 bytes
-2025/07/06-14:19:27.224 135c compacted to: files[ 0 0 1 0 0 0 0 ]
-2025/07/06-14:19:27.224 135c Delete type=2 #96
-2025/07/06-14:19:27.224 135c Delete type=2 #99
+2025/07/06-16:22:50.347 a403 Reusing MANIFEST /Users/adyutaindraadyatma/Personal/Codes/ai-wa-testnet/.wwebjs_auth/session-testnet-ai-wa/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2025/07/06-16:22:50.347 a403 Recovering log #131
+2025/07/06-16:22:50.364 a403 Reusing old log /Users/adyutaindraadyatma/Personal/Codes/ai-wa-testnet/.wwebjs_auth/session-testnet-ai-wa/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/000131.log 
+2025/07/06-16:22:52.579 8803 Level-0 table #137: started
+2025/07/06-16:22:52.586 8803 Level-0 table #137: 214205 bytes OK
+2025/07/06-16:22:52.596 8803 Delete type=0 #131
+2025/07/06-16:22:52.596 8803 Manual compaction at level-0 from '\x002\x00\x00\x00' @ 72057594037927935 : 1 .. '\x003\x00\x00\x00' @ 0 : 0; will stop at (end)
+2025/07/06-16:22:54.317 8803 Compacting 1@1 + 2@2 files
+2025/07/06-16:22:54.376 8803 Generated table #138@1: 57669 keys, 2224775 bytes
+2025/07/06-16:22:54.383 8803 Generated table #139@1: 5986 keys, 106529 bytes
+2025/07/06-16:22:54.384 8803 Compacted 1@1 + 2@2 files => 2331304 bytes
+2025/07/06-16:22:54.393 8803 compacted to: files[ 0 0 2 0 0 0 0 ]
