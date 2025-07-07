@@ -5,17 +5,21 @@ const { generateText } = require("ai");
 const { openai } = require("@ai-sdk/openai");
 const { createClient } = require("@supabase/supabase-js");
 const dotenv = require("dotenv");
-const PersonalizedTraining = require("./personalized-training");
-const TrainingScheduler = require("./training-scheduler");
-const UserPreferences = require("./user-preferences");
-const ConversationAnalyzer = require("./conversation-analyzer");
+const {
+  chunkText,
+  generateEmbeddings,
+  saveEmbeddingsToDb,
+  findRelevantContent,
+} = require("./embedding-helper");
+const { nanoid } = require("nanoid");
+const moment = require("moment");
+moment.locale("id");
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Initialize Supabase client
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 if (!supabaseUrl || !supabaseKey) {
@@ -23,20 +27,13 @@ if (!supabaseUrl || !supabaseKey) {
 }
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Initialize personalized training
-const personalizedTraining = new PersonalizedTraining();
-const trainingScheduler = new TrainingScheduler();
-const userPreferences = new UserPreferences();
-const conversationAnalyzer = new ConversationAnalyzer();
-
-// In-memory store for the last active image per user
 const activeImages = {};
 
 app.use(express.json());
 
 const openAiCompletion = async (
   messageHistory,
-  modelName = "gpt-4o",
+  modelName = "gpt-4o-mini",
   systemPrompt = null
 ) => {
   try {
@@ -70,10 +67,181 @@ client.on("qr", (qr) => {
   qrcode.generate(qr, { small: true });
 });
 
-// Main message handler
+// Helper untuk retry dengan delay jika rate limit
+async function safeGenerateText(params, maxRetry = 3, delayMs = 3000) {
+  for (let i = 0; i < maxRetry; i++) {
+    try {
+      return await generateText(params);
+    } catch (err) {
+      if (err.message && err.message.includes("rate limit")) {
+        if (i < maxRetry - 1) {
+          await new Promise((res) => setTimeout(res, delayMs));
+        } else {
+          throw err;
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+// Update detectIntent pakai gpt-3.5-turbo dan retry
+async function detectIntent(message) {
+  const prompt = `
+Tentukan intent dari kalimat berikut: "${message}".
+Pilihan intent: profil, list, hapus, hapus_semua, feedback, tanya, reminder, lain.
+Jika intent hapus, ekstrak keywordnya. Jika feedback, ekstrak positif/negatif. Jawab dalam format JSON: { intent: '...', keyword: '...', feedback: '...' }
+`;
+  const { text } = await safeGenerateText({
+    model: openai("gpt-3.5-turbo"),
+    maxTokens: 128,
+    system: "Kamu adalah asisten yang mendeteksi intent user.",
+    messages: [{ role: "user", content: prompt }],
+  });
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { intent: "lain" };
+  }
+}
+
+// Update extractUserFact pakai gpt-3.5-turbo dan retry
+async function extractUserFact(text) {
+  const prompt = `
+Kalimat berikut adalah pesan dari user:
+"${text}"
+
+Jika kalimat ini mengandung fakta unik tentang user (misal: preferensi, kebiasaan, hobi, alergi, dsb), ekstrak faktanya dalam satu kalimat. Abaikan kalimat sapaan, basa-basi, niat membantu, atau info generik. Jika tidak ada fakta unik, jawab: null.
+`;
+  const { text: result } = await safeGenerateText({
+    model: openai("gpt-3.5-turbo"),
+    maxTokens: 128,
+    system: "Kamu adalah asisten yang mengekstrak fakta user dari pesan.",
+    messages: [{ role: "user", content: prompt }],
+  });
+  return result.trim() === "null" ? null : result.trim();
+}
+
+// Fungsi untuk ekstrak info reminder dari pesan user (pakai LLM)
+async function extractReminderInfo(text) {
+  const prompt = `
+Kalimat berikut adalah permintaan reminder dari user:
+"${text}"
+
+Ekstrak waktu, tanggal, dan deskripsi jadwal. Jawab dalam format JSON:
+{ remind_at: "YYYY-MM-DDTHH:mm:ss+07:00", description: "..." }
+Jika tidak ada info reminder, jawab: null
+`;
+  const { text: result } = await generateText({
+    model: openai("gpt-3.5-turbo"),
+    maxTokens: 256,
+    system:
+      "Kamu adalah asisten yang mengekstrak info reminder dari pesan user.",
+    messages: [{ role: "user", content: prompt }],
+  });
+  try {
+    const parsed = JSON.parse(result);
+    if (parsed && parsed.remind_at && parsed.description) {
+      return parsed;
+    }
+  } catch {
+    // parsing gagal
+  }
+  return null;
+}
+
+// Handler profil user
+async function handleProfileRequest(chatId) {
+  const { data: facts } = await supabase
+    .from("embeddings")
+    .select("content")
+    .eq("user_id", chatId);
+  if (!facts || facts.length === 0) {
+    return "Saya belum punya cukup info tentang kamu.";
+  }
+  const prompt = `
+Buat ringkasan profil user berdasarkan fakta berikut:
+${facts.map((f) => "- " + f.content).join("\n")}
+Jawab dalam 2-3 kalimat.
+`;
+  const { text: result } = await generateText({
+    model: openai("gpt-4o-mini"),
+    maxTokens: 256,
+    system: "Kamu adalah asisten yang merangkum profil user.",
+    messages: [{ role: "user", content: prompt }],
+  });
+  return result;
+}
+
+// Handler list pengetahuan
+async function handleListKnowledge(chatId) {
+  const { data: facts } = await supabase
+    .from("embeddings")
+    .select("id, content")
+    .eq("user_id", chatId)
+    .limit(20);
+  if (!facts || facts.length === 0) {
+    return "Knowledge base kamu masih kosong.";
+  }
+  return (
+    "Pengetahuan kamu:\n" +
+    facts.map((f, i) => `${i + 1}. ${f.content}`).join("\n")
+  );
+}
+
+// Handler hapus pengetahuan
+async function handleDeleteKnowledge(chatId, keyword) {
+  const { data: facts } = await supabase
+    .from("embeddings")
+    .select("id, content")
+    .eq("user_id", chatId);
+  const toDelete = facts.filter((f) =>
+    f.content.toLowerCase().includes(keyword.toLowerCase())
+  );
+  if (toDelete.length === 0)
+    return `Tidak ada info yang cocok dengan "${keyword}".`;
+  for (const f of toDelete) {
+    await supabase.from("embeddings").delete().eq("id", f.id);
+  }
+  return `Berhasil menghapus ${toDelete.length} pengetahuan tentang "${keyword}".`;
+}
+
+// Handler hapus semua pengetahuan
+async function handleDeleteAllKnowledge(chatId) {
+  await supabase.from("embeddings").delete().eq("user_id", chatId);
+  return "Semua data kamu sudah dihapus.";
+}
+
+// Handler feedback (opsional: simpan ke DB/log)
+async function handleFeedback(chatId, feedback) {
+  // Simpan feedback ke DB/log jika ingin
+  return feedback === "positif"
+    ? "Terima kasih atas feedback positifnya!"
+    : "Terima kasih atas feedback, saya akan berusaha lebih baik.";
+}
+
+// Fungsi cosine similarity
+function cosineSimilarity(a, b) {
+  let dot = 0.0,
+    normA = 0.0,
+    normB = 0.0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
 client.on("message_create", async (message) => {
   const messageBody = (message.body || "").trim();
   const chatId = message.from;
+
+  // Hanya proses chat pribadi, abaikan group
+  if (!chatId.endsWith("@c.us")) {
+    return;
+  }
 
   try {
     // Fetch user and their state first
@@ -98,19 +266,109 @@ client.on("message_create", async (message) => {
       throw new Error(`Error fetching user: ${userError.message}`);
     }
 
-    // --- Normal message processing ---
-    if (messageBody.toLowerCase().startsWith("jek, train")) {
-      await handlePersonalizedTraining(message, user);
-    } else if (messageBody.toLowerCase().startsWith("jek, pilih ai")) {
-      await handleAISelection(message, user);
-    } else if (messageBody.toLowerCase().startsWith("jek, ai saya")) {
-      await handleAIConfiguration(message, user);
-    } else if (messageBody.toLowerCase().startsWith("jek")) {
-      await handleAiChat(message, user);
+    // Simpan pesan ke chat_history
+    const dbHistory = user.chat_history || [];
+    const newDbHistory = [...dbHistory, { role: "user", content: messageBody }];
+    await supabase
+      .from("users")
+      .update({ chat_history: newDbHistory })
+      .eq("id", chatId);
+
+    // Intent detection
+    const intentResult = await detectIntent(messageBody);
+    if (intentResult.intent === "profil") {
+      const response = await handleProfileRequest(chatId);
+      await client.sendMessage(chatId, response);
+      return;
+    }
+    if (intentResult.intent === "list") {
+      const response = await handleListKnowledge(chatId);
+      await client.sendMessage(chatId, response);
+      return;
+    }
+    if (intentResult.intent === "hapus" && intentResult.keyword) {
+      const response = await handleDeleteKnowledge(
+        chatId,
+        intentResult.keyword
+      );
+      await client.sendMessage(chatId, response);
+      return;
+    }
+    if (intentResult.intent === "hapus_semua") {
+      const response = await handleDeleteAllKnowledge(chatId);
+      await client.sendMessage(chatId, response);
+      return;
+    }
+    if (intentResult.intent === "feedback" && intentResult.feedback) {
+      const response = await handleFeedback(chatId, intentResult.feedback);
+      await client.sendMessage(chatId, response);
+      return;
+    }
+    if (intentResult.intent === "ask_time") {
+      const jamSekarang = moment().format("LT");
+      await client.sendMessage(chatId, `Sekarang jam ${jamSekarang}.`);
+      return;
+    }
+    // Reminder intent tetap jalan seperti sebelumnya (sudah ada extractReminderInfo)
+
+    // Hanya ekstrak dan simpan fakta jika intent simpan/profil/tanya
+    if (["simpan", "profil", "tanya"].includes(intentResult.intent)) {
+      const info = await extractUserFact(messageBody);
+      if (info) {
+        // Cek similarity sebelum simpan
+        const newEmbeddingArr = await generateEmbeddings([info]);
+        const newEmbedding = newEmbeddingArr[0].embedding;
+        const { data: existingEmbeddings } = await supabase
+          .from("embeddings")
+          .select("embedding, content")
+          .eq("user_id", chatId);
+        let isDuplicate = false;
+        if (existingEmbeddings && existingEmbeddings.length > 0) {
+          for (const e of existingEmbeddings) {
+            const similarity = cosineSimilarity(newEmbedding, e.embedding);
+            if (similarity > 0.9) {
+              isDuplicate = true;
+              break;
+            }
+          }
+        }
+        if (!isDuplicate) {
+          const chunks = chunkText(info);
+          const embeddings = await generateEmbeddings(chunks);
+          await saveEmbeddingsToDb(chatId, embeddings);
+          console.log(`Fakta user disimpan: ${info}`);
+        } else {
+          console.log(`Fakta user diabaikan (mirip/duplikat): ${info}`);
+        }
+      }
     }
 
-    // --- Post-chat analysis for training triggers ---
-    await analyzeAndTriggerTraining(message, user);
+    // Ekstrak dan simpan reminder jika ada
+    const reminder = await extractReminderInfo(messageBody);
+    if (reminder) {
+      const id = nanoid();
+      await supabase.from("reminders").insert([
+        {
+          id,
+          user_id: chatId,
+          remind_at: reminder.remind_at,
+          description: reminder.description,
+          is_sent: false,
+        },
+      ]);
+      // Format waktu ke bahasa Indonesia untuk response user
+      const remindAtLocal = moment(reminder.remind_at).format("LLLL");
+      await client.sendMessage(
+        chatId,
+        `✅ Reminder disimpan! Saya akan mengingatkan kamu pada ${remindAtLocal}.`
+      );
+      if (intentResult.intent === "reminder") {
+        return;
+      }
+    }
+
+    // Lanjutkan ke handleAiChat seperti biasa
+    await handleAiChat(message, user, intentResult.intent);
   } catch (error) {
     console.error("An error occurred:", error.message);
     await client.sendMessage(
@@ -120,170 +378,8 @@ client.on("message_create", async (message) => {
   }
 });
 
-// --- State-specific handlers ---
-
-async function handleAISelection(message, user) {
-  const chatId = user.id;
-  const messageBody = message.body.trim();
-
-  try {
-    // Extract AI type from command
-    const aiType = messageBody.substring("jek, pilih ai".length).trim();
-
-    if (!aiType) {
-      // Show available AI types
-      const availableAIs = userPreferences.getAvailableAITypes();
-      let response = "🤖 *Pilih AI Assistant Anda:*\n\n";
-
-      Object.entries(availableAIs).forEach(([key, ai]) => {
-        response += `*${ai.name}*\n`;
-        response += `${ai.description}\n`;
-        response += `Contoh: "jek, pilih ai ${key}"\n\n`;
-      });
-
-      response +=
-        "Ketik: jek, pilih ai [tipe] untuk memilih AI assistant Anda.";
-      await client.sendMessage(chatId, response);
-      return;
-    }
-
-    // Set user's AI preference
-    const result = await userPreferences.setUserAIPreference(chatId, aiType);
-
-    if (result.success) {
-      const aiDetails = result.aiDetails;
-      const examples = userPreferences.getExamplePrompts(aiType);
-
-      let response = `✅ *AI Assistant berhasil dipilih!*\n\n`;
-      response += `*${aiDetails.name}*\n`;
-      response += `${aiDetails.description}\n\n`;
-      response += `*Contoh pertanyaan:*\n`;
-      examples.forEach((example, index) => {
-        response += `${index + 1}. ${example}\n`;
-      });
-
-      response += `\nSekarang Anda bisa chat dengan AI ${aiDetails.name} yang personal!`;
-
-      await client.sendMessage(chatId, response);
-    }
-  } catch (error) {
-    console.error("Error in AI selection:", error);
-    await client.sendMessage(
-      chatId,
-      "❌ Terjadi kesalahan. Pastikan tipe AI yang Anda pilih tersedia."
-    );
-  }
-}
-
-async function handleAIConfiguration(message, user) {
-  const chatId = user.id;
-
-  try {
-    const userPref = await userPreferences.getUserAIPreference(chatId);
-
-    if (!userPref) {
-      await client.sendMessage(
-        chatId,
-        "❌ Anda belum memilih AI assistant. Ketik 'jek, pilih ai' untuk melihat pilihan."
-      );
-      return;
-    }
-
-    let response = `🤖 *AI Assistant Anda:*\n\n`;
-    response += `*Nama:* ${userPref.ai_name}\n`;
-    response += `*Deskripsi:* ${userPref.ai_description}\n`;
-    response += `*Focus Areas:* ${
-      userPref.focus_areas?.join(", ") || "Belum diatur"
-    }\n`;
-    response += `*Gaya Komunikasi:* ${
-      userPref.communication_style || "Formal"
-    }\n`;
-    response += `*Bahasa:* ${userPref.preferred_language || "Indonesia"}\n\n`;
-
-    response += `*Untuk mengubah AI:* jek, pilih ai [tipe]\n`;
-    response += `*Untuk training personal:* jek, train`;
-
-    await client.sendMessage(chatId, response);
-  } catch (error) {
-    console.error("Error in AI configuration:", error);
-    await client.sendMessage(
-      chatId,
-      "❌ Terjadi kesalahan saat mengambil konfigurasi AI."
-    );
-  }
-}
-
-async function handlePersonalizedTraining(message, user) {
-  const chatId = user.id;
-
-  try {
-    await client.sendMessage(
-      chatId,
-      "🔄 Memulai proses personalized training..."
-    );
-
-    // Check if user has enough conversation data
-    const chatHistory = user.chat_history || [];
-    const totalDataPoints = chatHistory.length;
-
-    if (totalDataPoints < 10) {
-      await client.sendMessage(
-        chatId,
-        `⚠️ Anda memerlukan minimal 10 percakapan untuk personalized training. 
-        Saat ini: ${totalDataPoints} percakapan.
-        
-        Lanjutkan chat dengan AI untuk mengumpulkan data.`
-      );
-      return;
-    }
-
-    // Create training dataset
-    const trainingData = await personalizedTraining.createTrainingDataset(
-      chatId
-    );
-
-    if (trainingData.length === 0) {
-      await client.sendMessage(
-        chatId,
-        "❌ Tidak ada data training yang cukup."
-      );
-      return;
-    }
-
-    // Start fine-tuning
-    const jobId = await personalizedTraining.createFineTunedModel(
-      chatId,
-      trainingData
-    );
-
-    // Save to database
-    await supabase
-      .from("users")
-      .update({
-        fine_tune_job_id: jobId,
-        is_training: true,
-        training_data_size: totalDataPoints,
-      })
-      .eq("id", chatId);
-
-    await client.sendMessage(
-      chatId,
-      `✅ Training dimulai! Job ID: ${jobId}
-      
-      Proses ini memakan waktu 1-2 jam. Saya akan memberitahu Anda ketika selesai.
-      
-      Data training: ${trainingData.length} examples`
-    );
-  } catch (error) {
-    console.error("Error in personalized training:", error);
-    await client.sendMessage(
-      chatId,
-      "❌ Terjadi kesalahan dalam proses training. Silakan coba lagi nanti."
-    );
-  }
-}
-
-async function handleAiChat(message, user) {
+// Update handleAiChat untuk explainability dan context injection
+async function handleAiChat(message, user, userIntent) {
   const messageBody = message.body.trim();
   const chatId = user.id;
   const hasMedia = message.hasMedia;
@@ -311,31 +407,54 @@ async function handleAiChat(message, user) {
 
   newUserMessageParts.push({ type: "text", text: messageBody });
 
-  // Get user's AI preference and create personalized system prompt
-  const userPref = await userPreferences.getUserAIPreference(chatId);
-  let systemPrompt =
-    "You are a helpful AI assistant integrated with WhatsApp. Provide clear, concise, and helpful responses. You remember the context of the conversation, including the last image sent. You were created by Zaky Iryad Rais.";
+  // Inject tanggal, jam, gaya, dan bahasa ke systemPrompt
+  const today = new Date();
+  const tanggalHariIni = today.toLocaleDateString("id-ID", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+  const jamSekarang = today.toLocaleTimeString("id-ID", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  // Deteksi gaya dan bahasa (sederhana, bisa dioptimasi)
+  const isFormal = /anda|bapak|ibu|saya|kami/i.test(messageBody);
+  const gaya = isFormal ? "formal" : "santai";
+  const isEnglish = /\b(the|and|you|your|what|how|can|please)\b/i.test(
+    messageBody
+  );
+  const bahasa = isEnglish ? "English" : "Indonesia";
+  let systemPrompt = `You are a helpful AI assistant. Hari ini adalah tanggal ${tanggalHariIni} dan jam sekarang ${jamSekarang}. Gaya komunikasi user: ${gaya}. Jawab dalam bahasa ${bahasa}.\n\nSaya (AI) bisa mengatur dan mengirimkan pengingat (reminder) secara otomatis ke user pada waktu yang diminta.`;
 
-  if (userPref && userPref.ai_type) {
-    systemPrompt = await userPreferences.createPersonalizedSystemPrompt(
-      chatId,
-      userPref.ai_type
-    );
-    console.log(`Using personalized AI: ${userPref.ai_name}`);
+  // Cek knowledge base
+  let context = "";
+  try {
+    const relevant = await findRelevantContent(chatId, messageBody);
+    if (relevant && relevant.length > 0) {
+      context = relevant.map((r) => r.content).join("\n");
+      systemPrompt += `\n\nInformasi tentang user:\n${context}`;
+    }
+  } catch (e) {
+    console.error("Error searching knowledge base:", e.message);
   }
 
-  // Use personalized model if available
-  let modelToUse = "gpt-4o";
-  if (user.personalized_model_id) {
-    modelToUse = user.personalized_model_id;
-    console.log(`Using personalized model: ${modelToUse}`);
+  // Explainability jika knowledge base digunakan
+  if (context) {
+    systemPrompt +=
+      "\n\nSaya menjawab berdasarkan info yang kamu pernah sampaikan.";
   }
 
   const aiMessages = [
     ...formattedHistory,
     { role: "user", content: newUserMessageParts },
   ];
-  const response = await openAiCompletion(aiMessages, modelToUse, systemPrompt);
+  const response = await openAiCompletion(
+    aiMessages,
+    "gpt-4o-mini",
+    systemPrompt
+  );
 
   if (response) {
     if (!hasMedia && messageBody.toLowerCase().includes("lupakan gambar")) {
@@ -357,67 +476,41 @@ async function handleAiChat(message, user) {
       })
       .eq("id", user.id);
 
+    // Tawarkan feedback setelah jawaban
     await client.sendMessage(chatId, response);
   }
 }
 
-async function analyzeAndTriggerTraining(message, user) {
-  const chatId = user.id;
-  const messageBody = message.body.trim();
-
-  try {
-    // Skip analysis for commands
-    if (messageBody.toLowerCase().startsWith("jek, ")) {
-      return;
-    }
-
-    // Analyze user consent for any training-related questions
-    const consent = await conversationAnalyzer.analyzeUserConsent(messageBody);
-
-    if (consent === "AGREE") {
-      // Check if we should suggest training
-      const chatHistory = user.chat_history || [];
-      const shouldTrain = await conversationAnalyzer.shouldTriggerTraining(
-        chatHistory,
-        user.last_training_at
-      );
-
-      if (shouldTrain) {
+// Update reminderScheduler agar waktu reminder juga diformat ke bahasa Indonesia
+async function reminderScheduler() {
+  setInterval(async () => {
+    const nowUtc = moment().utc().format();
+    const { data: reminders } = await supabase
+      .from("reminders")
+      .select("*")
+      .eq("is_sent", false)
+      .lte("remind_at", nowUtc);
+    if (reminders && reminders.length > 0) {
+      for (const reminder of reminders) {
+        const remindAtLocal = moment(reminder.remind_at).format("LLLL");
         await client.sendMessage(
-          chatId,
-          "🤖 Saya melihat percakapan kita sudah cukup banyak dan berkualitas. Apakah Anda ingin saya melakukan personalized training untuk memberikan respons yang lebih baik?"
+          reminder.user_id,
+          `⏰ Reminder: ${reminder.description}\nWaktu: ${remindAtLocal}`
         );
+        await supabase
+          .from("reminders")
+          .update({ is_sent: true })
+          .eq("id", reminder.id);
       }
     }
-
-    // Analyze conversation quality and update user preferences
-    const chatHistory = user.chat_history || [];
-    if (chatHistory.length > 5) {
-      const style = await conversationAnalyzer.detectCommunicationStyle(
-        chatHistory
-      );
-      const sentiment = await conversationAnalyzer.analyzeSentiment(
-        messageBody
-      );
-
-      // Update user preferences based on analysis
-      await userPreferences.updateCommunicationPreferences(chatId, {
-        communication_style: style.toLowerCase(),
-        preferred_language: "id", // Default to Indonesian
-      });
-    }
-  } catch (error) {
-    console.error("Error in conversation analysis:", error);
-    // Don't send error message to user, just log it
-  }
+  }, 60 * 1000);
 }
 
-// Start the client
 client.initialize();
+
+// Jalankan scheduler reminder saat bot start
+reminderScheduler();
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
-
-  // Start training scheduler
-  trainingScheduler.start();
 });
